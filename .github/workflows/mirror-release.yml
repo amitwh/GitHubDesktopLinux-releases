@@ -1,0 +1,97 @@
+name: Mirror release
+
+# Publishes a release that was built by the source repository into this
+# binary-mirror repository.
+#
+# The source repository (amitwh/GitHubDesktopLinux) builds the artefacts and
+# publishes them to a release in its own repository using its GITHUB_TOKEN.
+# This workflow then copies that release's assets into an identically tagged
+# release here, using *this* repository's GITHUB_TOKEN.
+#
+# No long-lived credential crosses the repository boundary: the source
+# release is public, so its assets are fetched over plain HTTPS, and the only
+# token involved is the short-lived, repository-scoped one this workflow
+# already has. A fine-grained PAT with Contents:write on this repository
+# would work too, but it would mean storing a credential that can outlive
+# the run.
+#
+# Assets already present on the mirrored release are left alone — this
+# workflow only adds and replaces, so a release that carries extra files
+# (for example a flatpak built outside CI) keeps them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description:
+          'Version to mirror, without the leading v (e.g. 3.6.7-fork1).'
+        required: true
+        type: string
+      source-repo:
+        description:
+          'owner/name of the repository holding the source release.'
+        required: false
+        default: 'amitwh/GitHubDesktopLinux'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    name: Mirror release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch the source release
+        id: source
+        env:
+          SOURCE_REPO: ${{ inputs.source-repo }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! echo "$VERSION" | grep -qE '^[0-9A-Za-z.+-]+$'; then
+            echo "::error::Invalid version '${VERSION}'"
+            exit 1
+          fi
+          if ! echo "$SOURCE_REPO" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::Invalid repository '${SOURCE_REPO}'"
+            exit 1
+          fi
+
+          API="https://api.github.com/repos/${SOURCE_REPO}/releases/tags/v${VERSION}"
+          RELEASE=$(curl -fsSL --retry 5 --retry-all-errors "$API")
+          mkdir -p packages
+          printf '%s' "$RELEASE" | jq -r '.assets[].browser_download_url' > urls.txt
+          if [ ! -s urls.txt ]; then
+            echo "::error::Source release v${VERSION} in ${SOURCE_REPO} has no assets"
+            exit 1
+          fi
+          while read -r url; do
+            echo "Downloading ${url}"
+            curl -fsSL --retry 5 --retry-all-errors \
+              -O --output-dir packages "$url"
+          done < urls.txt
+
+          # The release notes are written to a file and passed to the action
+          # as a path, so nothing from the source release is ever evaluated
+          # as an expression or a shell command.
+          printf '%s' "$RELEASE" | jq -r '.body // ""' > notes.md
+
+          ls -la packages
+
+      - name: Publish the mirror release
+        uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
+        with:
+          token: ${{ github.token }}
+          tag_name: v${{ inputs.version }}
+          name: GitHub Desktop Linux ${{ inputs.version }}
+          body_path: notes.md
+          files: packages/*
+          repository: ${{ github.repository }}
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          draft: false
+          prerelease: false
