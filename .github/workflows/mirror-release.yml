@@ -15,9 +15,16 @@ name: Mirror release
 # would work too, but it would mean storing a credential that can outlive
 # the run.
 #
+# Integrity: every asset is verified against the sha256 digest that the
+# GitHub API reports for it before it is written into the packages
+# directory, so only bytes that the API vouched for are ever published.
+# The API response is fetched over TLS from api.github.com with the source
+# repository hardcoded below, so the digest is as trustworthy as the API
+# itself.
+#
 # Assets already present on the mirrored release are left alone — this
 # workflow only adds and replaces, so a release that carries extra files
-# (for example a flatpak built outside CI) keeps them.
+# keeps them.
 
 on:
   workflow_dispatch:
@@ -26,12 +33,6 @@ on:
         description:
           'Version to mirror, without the leading v (e.g. 3.6.7-fork1).'
         required: true
-        type: string
-      source-repo:
-        description:
-          'owner/name of the repository holding the source release.'
-        required: false
-        default: 'amitwh/GitHubDesktopLinux'
         type: string
 
 permissions:
@@ -44,36 +45,70 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Fetch the source release
+      - name: Fetch and verify the source release
         id: source
         env:
-          SOURCE_REPO: ${{ inputs.source-repo }}
+          # The one and only source this mirror trusts. Hardcoded rather than
+          # an input so that a workflow_dispatch caller cannot point the
+          # download at an arbitrary repository.
+          SOURCE_REPO: amitwh/GitHubDesktopLinux
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
-          if ! echo "$VERSION" | grep -qE '^[0-9A-Za-z.+-]+$'; then
+          if ! echo "$VERSION" | grep -qE '^[0-9]+(\.[0-9]+)*(-[A-Za-z0-9.]+)?$'; then
             echo "::error::Invalid version '${VERSION}'"
-            exit 1
-          fi
-          if ! echo "$SOURCE_REPO" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
-            echo "::error::Invalid repository '${SOURCE_REPO}'"
             exit 1
           fi
 
           API="https://api.github.com/repos/${SOURCE_REPO}/releases/tags/v${VERSION}"
           RELEASE=$(curl -fsSL --retry 5 --retry-all-errors "$API")
-          mkdir -p packages
-          printf '%s' "$RELEASE" | jq -r '.assets[].browser_download_url' > urls.txt
-          if [ ! -s urls.txt ]; then
+          mkdir -p packages tmp
+
+          COUNT=$(printf '%s' "$RELEASE" | jq '.assets | length')
+          if [ "$COUNT" -eq 0 ]; then
             echo "::error::Source release v${VERSION} in ${SOURCE_REPO} has no assets"
             exit 1
           fi
-          while read -r url; do
-            echo "Downloading ${url}"
-            curl -fsSL --retry 5 --retry-all-errors \
-              -O --output-dir packages "$url"
-          done < urls.txt
+
+          # For each asset: fetch the bytes to a temporary file, check the
+          # sha256 digest the API published for it, and only then move it
+          # into place under a name derived from the API's asset name (not
+          # from the download URL).
+          printf '%s' "$RELEASE" | jq -r '
+            .assets[]
+            | [.name, .browser_download_url, .digest] | @tsv
+          ' > assets.tsv
+
+          while IFS=$'\t' read -r NAME URL DIGEST; do
+            if ! echo "$NAME" | grep -qE '^[A-Za-z0-9._+-]+\.(deb|AppImage|snap|flatpak|exe|msi|nupkg)$'; then
+              echo "::error::Refusing asset with unexpected name '${NAME}'"
+              exit 1
+            fi
+            if ! echo "$URL" | grep -qE '^https://(github\.com|release-assets\.githubusercontent\.com)/'; then
+              echo "::error::Refusing asset with unexpected download host '${URL}'"
+              exit 1
+            fi
+            case "$DIGEST" in
+              sha256:*)
+                EXPECTED="${DIGEST#sha256:}"
+                ;;
+              *)
+                echo "::error::Asset '${NAME}' has no sha256 digest; refusing to publish it unverified"
+                exit 1
+                ;;
+            esac
+
+            echo "Fetching ${NAME}"
+            curl -fsSL --retry 5 --retry-all-errors -o "tmp/${NAME}" "$URL"
+            ACTUAL=$(sha256sum "tmp/${NAME}" | cut -d' ' -f1)
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+              echo "::error::Digest mismatch for ${NAME}: expected ${EXPECTED}, got ${ACTUAL}"
+              exit 1
+            fi
+            mv "tmp/${NAME}" "packages/${NAME}"
+            echo "Verified ${NAME} (sha256 ${ACTUAL})"
+          done < assets.tsv
 
           # The release notes are written to a file and passed to the action
           # as a path, so nothing from the source release is ever evaluated
