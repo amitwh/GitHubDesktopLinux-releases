@@ -117,6 +117,40 @@ jobs:
 
           ls -la packages
 
+      # The release action replaces an asset by deleting it and re-uploading
+      # under the same name, but the release-asset API is eventually
+      # consistent: the re-upload can still see the asset that is being
+      # deleted and fail with "already_exists". Deleting the assets this run
+      # will publish up front, and giving the change a moment to propagate,
+      # means the upload never races a pending delete — so re-mirroring a
+      # version works.
+      - name: Remove superseded assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: v${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! RELEASE_ID=$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq .id 2>/dev/null); then
+            echo "No existing release ${TAG} — nothing to clean up"
+            exit 0
+          fi
+
+          for FILE in packages/*; do
+            [ -e "$FILE" ] || continue
+            NAME=$(basename "$FILE")
+            ID=$(gh api "repos/${REPO}/releases/${RELEASE_ID}/assets" \
+              --jq ".[] | select(.name == \"${NAME}\") | .id" || true)
+            if [ -n "$ID" ]; then
+              echo "Deleting superseded asset ${NAME}"
+              gh api --method DELETE "repos/${REPO}/releases/assets/${ID}"
+            fi
+          done
+
+          # Let the deletions land before the upload.
+          sleep 20
+
       - name: Publish the mirror release
         uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
         with:
